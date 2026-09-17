@@ -168,11 +168,11 @@
   background: var(--bg);
 }
 
-.caller {
+.turnPerson {
   border-left: 3px solid var(--accent);
 }
 
-.gemini {
+.turnGemini {
   border-left: 3px solid #3fb37f;
 }
 
@@ -212,15 +212,15 @@
   font-weight: 600;
 }
 
-.info .kind {
+.logInfo .kind {
   color: #8a93a0;
 }
-.daily .kind {
+.logDaily .kind {
   color: #5b9cff;
 }
-.gemini .kind {
+.logGemini .kind {
   color: #3fb37f;
 }
-.error .kind {
+.logError .kind {
   color: #ff5c5c;
 }

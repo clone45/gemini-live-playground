@@ -10,9 +10,13 @@ import { DEFAULT_VOICE, VOICES } from '@/lib/voices';
 import styles from './dial-out.module.css';
 
 /**
- * Dial-out test: Daily places a PSTN call, and the browser acts as the AI
- * participant in the room, bridging the caller's audio to a Gemini Live
- * session and publishing Gemini's speech back as its own microphone track.
+ * Places a real phone call through Daily and puts Gemini on the line.
+ *
+ * The conversation happens over the phone. This tab is only the bridge: it
+ * feeds the answering person's audio to a Gemini Live session and publishes
+ * Gemini's speech back into the call as its own microphone track. Nobody at
+ * this computer is part of the conversation unless the diagnostic mode below
+ * is switched on.
  */
 
 const MODEL_ID = 'gemini-3.8-live';
@@ -34,7 +38,7 @@ interface LogRow {
 
 interface Turn {
   id: string;
-  who: 'caller' | 'gemini';
+  who: 'person' | 'gemini';
   text: string;
 }
 
@@ -45,6 +49,14 @@ interface CallerId {
   status: string;
   verified: boolean;
 }
+
+/** Log kinds map to their own classes so they do not collide with transcript styling. */
+const LOG_CLASS: Record<LogRow['kind'], string> = {
+  info: 'logInfo',
+  daily: 'logDaily',
+  gemini: 'logGemini',
+  error: 'logError',
+};
 
 const PHASE_LABEL: Record<Phase, string> = {
   idle: 'Idle',
@@ -65,7 +77,7 @@ export function DialOut() {
   const [voiceName, setVoiceName] = useState(DEFAULT_VOICE);
   const [instruction, setInstruction] = useState(DEFAULT_INSTRUCTION);
   const [aiAnswers, setAiAnswers] = useState(true);
-  const [monitor, setMonitor] = useState(true);
+  const [listenIn, setListenIn] = useState(true);
 
   const [phase, setPhase] = useState<Phase>('idle');
   const [logs, setLogs] = useState<LogRow[]>([]);
@@ -82,8 +94,9 @@ export function DialOut() {
   const sinkRef = useRef<CallAudioSink | null>(null);
   const bridgedRef = useRef(false);
   const dialoutSessionRef = useRef<string | null>(null);
-  const callerTurnRef = useRef<string | null>(null);
+  const personTurnRef = useRef<string | null>(null);
   const geminiTurnRef = useRef<string | null>(null);
+  const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
 
   const log = useCallback((kind: LogRow['kind'], text: string) => {
     setLogs((prev) => [...prev.slice(-250), { id: newId(), at: Date.now(), kind, text }]);
@@ -130,8 +143,8 @@ export function DialOut() {
   }, [log]);
 
   const appendTurn = useCallback((who: Turn['who'], text: string) => {
-    const own = who === 'caller' ? callerTurnRef : geminiTurnRef;
-    const other = who === 'caller' ? geminiTurnRef : callerTurnRef;
+    const own = who === 'person' ? personTurnRef : geminiTurnRef;
+    const other = who === 'person' ? geminiTurnRef : personTurnRef;
     other.current = null;
     if (own.current) {
       const id = own.current;
@@ -146,7 +159,7 @@ export function DialOut() {
   const teardown = useCallback(async () => {
     bridgedRef.current = false;
     dialoutSessionRef.current = null;
-    callerTurnRef.current = null;
+    personTurnRef.current = null;
     geminiTurnRef.current = null;
 
     sessionRef.current?.close();
@@ -171,7 +184,7 @@ export function DialOut() {
     setGeminiSpeaking(false);
   }, []);
 
-  /** Wire the caller's audio to Gemini and Gemini's speech back into the call. */
+  /** Put Gemini on the line: their audio in, Gemini's speech back out. */
   const bridgeToGemini = useCallback(
     async (track: MediaStreamTrack) => {
       if (bridgedRef.current) return;
@@ -184,7 +197,7 @@ export function DialOut() {
       }
 
       const sink = new CallAudioSink();
-      sink.monitoring = monitor;
+      sink.monitoring = listenIn;
       sink.onSpeakingChange = setGeminiSpeaking;
       await sink.resume();
       sinkRef.current = sink;
@@ -203,15 +216,15 @@ export function DialOut() {
         },
         {
           onAudio: (data) => sink.enqueue(data),
-          onInputTranscription: (text) => appendTurn('caller', text),
+          onInputTranscription: (text) => appendTurn('person', text),
           onOutputTranscription: (text) => appendTurn('gemini', text),
           onInterrupted: () => {
             sink.interrupt();
             geminiTurnRef.current = null;
-            log('gemini', 'Caller interrupted, flushing queued speech');
+            log('gemini', 'They interrupted, flushing queued speech');
           },
           onTurnComplete: () => {
-            callerTurnRef.current = null;
+            personTurnRef.current = null;
             geminiTurnRef.current = null;
           },
           onError: (e) => {
@@ -231,12 +244,12 @@ export function DialOut() {
       const recorder = new TrackRecorder((chunk) => sessionRef.current?.sendAudio(chunk));
       recorderRef.current = recorder;
       await recorder.start(track);
-      log('daily', "Streaming the caller's audio to Gemini at 16 kHz");
+      log('daily', 'Streaming their audio to Gemini at 16 kHz');
 
-      // Speak first: the callee answered, so open the conversation.
+      // Speak first: they just answered, so open the conversation.
       session.sendText('The person has just answered the phone. Greet them now.');
     },
-    [appendTurn, instruction, log, monitor, voiceName],
+    [appendTurn, instruction, listenIn, log, voiceName],
   );
 
   const startCall = useCallback(async () => {
@@ -291,7 +304,13 @@ export function DialOut() {
       const onTrack = (ev?: { participant?: DailyParticipant | null; track?: MediaStreamTrack; type?: string }) => {
         if (!ev?.track || ev.track.kind !== 'audio') return;
         if (ev.participant?.local) return;
-        log('daily', `Remote audio track from ${ev.participant?.user_name || 'caller'}`);
+        log('daily', `Audio from ${ev.participant?.user_name || 'the phone'}`);
+        // Call-object mode does not play remote audio for you.
+        if (remoteAudioRef.current) {
+          remoteAudioRef.current.srcObject = new MediaStream([ev.track]);
+          remoteAudioRef.current.muted = !(listenIn || !aiAnswers);
+          void remoteAudioRef.current.play().catch(() => {});
+        }
         if (aiAnswers) void bridgeToGemini(ev.track);
       };
       call.on('track-started', onTrack);
@@ -321,7 +340,7 @@ export function DialOut() {
       setPhase('ended');
       await teardown();
     }
-  }, [aiAnswers, bridgeToGemini, log, phoneNumber, teardown]);
+  }, [aiAnswers, bridgeToGemini, callerId, listenIn, log, phoneNumber, teardown]);
 
   const hangUp = useCallback(async () => {
     log('info', 'Hanging up');
@@ -337,9 +356,14 @@ export function DialOut() {
     setPhase('ended');
   }, [log, teardown]);
 
+  // "Listen in" covers both directions: Gemini's speech through the sink, and
+  // the other person's audio through the element below. In manual mode you must
+  // hear them to hold a conversation, so it is forced on.
+  const audible = listenIn || !aiAnswers;
   useEffect(() => {
-    if (sinkRef.current) sinkRef.current.monitoring = monitor;
-  }, [monitor]);
+    if (sinkRef.current) sinkRef.current.monitoring = audible;
+    if (remoteAudioRef.current) remoteAudioRef.current.muted = !audible;
+  }, [audible]);
 
   useEffect(() => {
     return () => {
@@ -354,8 +378,9 @@ export function DialOut() {
     <main className={styles.page}>
       <h1>Daily dial-out test</h1>
       <p className={styles.lede}>
-        Daily places a PSTN call and this browser tab acts as the AI participant, bridging the
-        caller to Gemini Live. <a href="/">Console</a> · <a href="/mic-test">Microphone test</a>
+        Calls a real phone through Daily and puts Gemini on the line. You talk to the agent on your
+        phone, not through this computer. This tab is only the bridge and stays out of the
+        conversation. <a href="/">Console</a> · <a href="/mic-test">Microphone test</a>
       </p>
 
       {numbersWarning && <p className={styles.warning}>{numbersWarning}</p>}
@@ -363,7 +388,7 @@ export function DialOut() {
       <section className={styles.card}>
         <div className={styles.controls}>
           <label>
-            Number to call (E.164)
+            Your phone number (E.164)
             <input
               type="tel"
               name="phoneNumber"
@@ -388,7 +413,7 @@ export function DialOut() {
           ) : (
             callerId && (
               <p className={styles.hint}>
-                They will see <strong>{callerId}</strong> as the caller.
+                Your phone will show <strong>{callerId}</strong>.
               </p>
             )
           )}
@@ -400,8 +425,11 @@ export function DialOut() {
               onChange={(e) => setAiAnswers(e.target.checked)}
               disabled={locked}
             />
-            Let Gemini do the talking. Unchecked, your own microphone is used, which tests the phone
-            leg on its own.
+            <span>
+              <strong>Gemini answers on the line.</strong> Leave this on. Turning it off is a
+              diagnostic: it puts <em>you</em> on the call from this computer instead of Gemini, so
+              you can check the phone leg works before blaming the AI bridge.
+            </span>
           </label>
 
           {aiAnswers && (
@@ -427,8 +455,11 @@ export function DialOut() {
                 />
               </label>
               <label className={styles.check}>
-                <input type="checkbox" checked={monitor} onChange={(e) => setMonitor(e.target.checked)} />
-                Monitor locally, so you hear what the caller hears
+                <input type="checkbox" checked={listenIn} onChange={(e) => setListenIn(e.target.checked)} />
+                <span>
+                  Listen in from this computer. Plays both sides through your speakers so you can
+                  follow along. Your microphone stays out of the call either way.
+                </span>
               </label>
             </>
           )}
@@ -451,17 +482,20 @@ export function DialOut() {
         </div>
 
         {error && <p className={styles.error}>{error}</p>}
+
+        {/* Call-object mode renders no remote audio on its own. */}
+        <audio ref={remoteAudioRef} autoPlay playsInline hidden />
       </section>
 
       <section className={styles.card}>
         <h2>Conversation</h2>
         {turns.length === 0 ? (
-          <p className={styles.hint}>Transcripts of both sides appear here once the call connects.</p>
+          <p className={styles.hint}>What you and Gemini say on the phone appears here once the call connects.</p>
         ) : (
           <div className={styles.turns}>
             {turns.map((t) => (
-              <p key={t.id} className={t.who === 'caller' ? styles.caller : styles.gemini}>
-                <strong>{t.who === 'caller' ? 'Caller' : 'Gemini'}</strong> {t.text}
+              <p key={t.id} className={t.who === 'person' ? styles.turnPerson : styles.turnGemini}>
+                <strong>{t.who === 'person' ? 'Phone' : 'Gemini'}</strong> {t.text}
               </p>
             ))}
           </div>
@@ -473,7 +507,7 @@ export function DialOut() {
         <div className={styles.logs}>
           {logs.length === 0 && <p className={styles.hint}>Nothing yet.</p>}
           {logs.map((row) => (
-            <div key={row.id} className={styles[row.kind]}>
+            <div key={row.id} className={styles[LOG_CLASS[row.kind]]}>
               <span className={styles.time}>{new Date(row.at).toLocaleTimeString([], { hour12: false })}</span>
               <span className={styles.kind}>{row.kind}</span>
               <span>{row.text}</span>
