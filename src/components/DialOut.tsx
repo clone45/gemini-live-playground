@@ -17,9 +17,17 @@ import styles from './dial-out.module.css';
  * Gemini's speech back into the call as its own microphone track. Nobody at
  * this computer is part of the conversation unless the diagnostic mode below
  * is switched on.
+ *
+ * Gemini is connected and publishing as soon as the room is joined, before
+ * anyone answers. An earlier version only started it when their audio track
+ * arrived, so a failed receive transport meant Gemini never ran at all and the
+ * line was simply silent.
  */
 
 const MODEL_ID = 'gemini-3.8-live';
+
+/** How long after they answer before a total lack of inbound audio is called out. */
+const NO_AUDIO_WARN_MS = 8000;
 
 const DEFAULT_INSTRUCTION =
   'You are placing a brief, friendly test call. The person agreed in advance to receive it. ' +
@@ -44,6 +52,8 @@ interface Turn {
 
 /** A number purchased on the Daily domain, usable as outbound caller ID. */
 interface CallerId {
+  /** Daily's identifier for the number. Dial-out's callerId resolves by this. */
+  id: string;
   number: string;
   label: string;
   status: string;
@@ -85,24 +95,34 @@ export function DialOut() {
   const [error, setError] = useState<string | null>(null);
   const [numbersWarning, setNumbersWarning] = useState<string | null>(null);
   const [callerIds, setCallerIds] = useState<CallerId[]>([]);
-  const [callerId, setCallerId] = useState('');
+  const [callerId, setCallerId] = useState<CallerId | null>(null);
   const [geminiSpeaking, setGeminiSpeaking] = useState(false);
+  const [chunksIn, setChunksIn] = useState(0);
+  const [bytesOut, setBytesOut] = useState(0);
 
   const callRef = useRef<DailyCall | null>(null);
   const sessionRef = useRef<LiveSession | null>(null);
   const recorderRef = useRef<TrackRecorder | null>(null);
   const sinkRef = useRef<CallAudioSink | null>(null);
-  const bridgedRef = useRef(false);
   const dialoutSessionRef = useRef<string | null>(null);
   const personTurnRef = useRef<string | null>(null);
   const geminiTurnRef = useRef<string | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const chunksInRef = useRef(0);
+  const bytesOutRef = useRef(0);
+  const attachedRef = useRef(false);
+  const watchdogRef = useRef<number | null>(null);
+  const aiAnswersRef = useRef(aiAnswers);
+  const listenInRef = useRef(listenIn);
+
+  aiAnswersRef.current = aiAnswers;
+  listenInRef.current = listenIn;
 
   const log = useCallback((kind: LogRow['kind'], text: string) => {
-    setLogs((prev) => [...prev.slice(-250), { id: newId(), at: Date.now(), kind, text }]);
+    setLogs((prev) => [...prev.slice(-300), { id: newId(), at: Date.now(), kind, text }]);
   }, []);
 
-  // Dial-out needs a purchased number for caller ID; warn before the attempt.
+  // Dial-out needs a purchased number for caller ID; check before the attempt.
   useEffect(() => {
     let cancelled = false;
     fetch('/api/daily/numbers')
@@ -124,9 +144,8 @@ export function DialOut() {
           return;
         }
 
-        // Prefer a verified number; an unverified one can be refused outbound.
         const usable = numbers.find((n) => n.verified) ?? numbers[0];
-        setCallerId(usable.number);
+        setCallerId(usable);
         setNumbersWarning(
           usable.verified
             ? null
@@ -157,7 +176,11 @@ export function DialOut() {
   }, []);
 
   const teardown = useCallback(async () => {
-    bridgedRef.current = false;
+    if (watchdogRef.current) {
+      window.clearTimeout(watchdogRef.current);
+      watchdogRef.current = null;
+    }
+    attachedRef.current = false;
     dialoutSessionRef.current = null;
     personTurnRef.current = null;
     geminiTurnRef.current = null;
@@ -170,6 +193,8 @@ export function DialOut() {
 
     await sinkRef.current?.close();
     sinkRef.current = null;
+
+    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
 
     const call = callRef.current;
     callRef.current = null;
@@ -184,72 +209,88 @@ export function DialOut() {
     setGeminiSpeaking(false);
   }, []);
 
-  /** Put Gemini on the line: their audio in, Gemini's speech back out. */
-  const bridgeToGemini = useCallback(
-    async (track: MediaStreamTrack) => {
-      if (bridgedRef.current) return;
-      bridgedRef.current = true;
+  /**
+   * Connect Gemini and publish its voice into the room. Done at join time so
+   * the agent is live before anyone answers, independent of whether their
+   * audio ever reaches us.
+   */
+  const startGemini = useCallback(async () => {
+    const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+    if (!apiKey) throw new Error('NEXT_PUBLIC_GEMINI_API_KEY is not set, so Gemini cannot answer.');
 
-      const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
-      if (!apiKey) {
-        setError('NEXT_PUBLIC_GEMINI_API_KEY is not set, so Gemini cannot answer.');
-        return;
+    const sink = new CallAudioSink();
+    sink.monitoring = listenInRef.current;
+    sink.onSpeakingChange = setGeminiSpeaking;
+    await sink.resume();
+    sinkRef.current = sink;
+
+    const session = new LiveSession(apiKey);
+    sessionRef.current = session;
+
+    await session.connect(
+      MODEL_ID,
+      {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } },
+        systemInstruction: instruction.trim() || DEFAULT_INSTRUCTION,
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
+      },
+      {
+        onAudio: (data) => {
+          bytesOutRef.current += Math.floor((data.length * 3) / 4);
+          setBytesOut(bytesOutRef.current);
+          sink.enqueue(data);
+        },
+        onInputTranscription: (text) => appendTurn('person', text),
+        onOutputTranscription: (text) => appendTurn('gemini', text),
+        onInterrupted: () => {
+          sink.interrupt();
+          geminiTurnRef.current = null;
+          log('gemini', 'They interrupted, flushing queued speech');
+        },
+        onTurnComplete: () => {
+          personTurnRef.current = null;
+          geminiTurnRef.current = null;
+        },
+        onError: (e) => {
+          setError(e.message);
+          log('error', `Gemini: ${e.message}`);
+        },
+        onClose: (code, reason) => log('gemini', `Gemini session closed (${code}${reason ? ` ${reason}` : ''})`),
+      },
+    );
+    log('gemini', `Gemini connected, voice ${voiceName}`);
+
+    await callRef.current?.setInputDevicesAsync({ audioSource: sink.track });
+    await callRef.current?.setLocalAudio(true);
+    log('daily', "Publishing Gemini's audio into the room");
+  }, [appendTurn, instruction, log, voiceName]);
+
+  /** Attach the phone's audio to Gemini once its track actually arrives. */
+  const attachPhoneAudio = useCallback(
+    async (track: MediaStreamTrack) => {
+      if (attachedRef.current) return;
+      attachedRef.current = true;
+
+      if (remoteAudioRef.current) {
+        remoteAudioRef.current.srcObject = new MediaStream([track]);
+        remoteAudioRef.current.muted = !(listenInRef.current || !aiAnswersRef.current);
+        void remoteAudioRef.current.play().catch(() => {});
       }
 
-      const sink = new CallAudioSink();
-      sink.monitoring = listenIn;
-      sink.onSpeakingChange = setGeminiSpeaking;
-      await sink.resume();
-      sinkRef.current = sink;
+      if (!aiAnswersRef.current) return;
 
-      const session = new LiveSession(apiKey);
-      sessionRef.current = session;
-
-      await session.connect(
-        MODEL_ID,
-        {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } },
-          systemInstruction: instruction.trim() || DEFAULT_INSTRUCTION,
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-        },
-        {
-          onAudio: (data) => sink.enqueue(data),
-          onInputTranscription: (text) => appendTurn('person', text),
-          onOutputTranscription: (text) => appendTurn('gemini', text),
-          onInterrupted: () => {
-            sink.interrupt();
-            geminiTurnRef.current = null;
-            log('gemini', 'They interrupted, flushing queued speech');
-          },
-          onTurnComplete: () => {
-            personTurnRef.current = null;
-            geminiTurnRef.current = null;
-          },
-          onError: (e) => {
-            setError(e.message);
-            log('error', `Gemini: ${e.message}`);
-          },
-          onClose: (code, reason) => log('gemini', `Gemini session closed (${code}${reason ? ` ${reason}` : ''})`),
-        },
-      );
-      log('gemini', `Connected to ${MODEL_ID} as voice ${voiceName}`);
-
-      // Publish Gemini's voice as this participant's microphone.
-      await callRef.current?.setInputDevicesAsync({ audioSource: sink.track });
-      await callRef.current?.setLocalAudio(true);
-      log('daily', 'Publishing Gemini audio into the call');
-
-      const recorder = new TrackRecorder((chunk) => sessionRef.current?.sendAudio(chunk));
+      const recorder = new TrackRecorder((chunk) => {
+        sessionRef.current?.sendAudio(chunk);
+        chunksInRef.current += 1;
+        setChunksIn(chunksInRef.current);
+      });
       recorderRef.current = recorder;
       await recorder.start(track);
       log('daily', 'Streaming their audio to Gemini at 16 kHz');
-
-      // Speak first: they just answered, so open the conversation.
-      session.sendText('The person has just answered the phone. Greet them now.');
     },
-    [appendTurn, instruction, listenIn, log, voiceName],
+    [log],
   );
 
   const startCall = useCallback(async () => {
@@ -259,6 +300,10 @@ export function DialOut() {
     }
     setError(null);
     setTurns([]);
+    chunksInRef.current = 0;
+    bytesOutRef.current = 0;
+    setChunksIn(0);
+    setBytesOut(0);
     setPhase('preparing');
 
     try {
@@ -274,13 +319,58 @@ export function DialOut() {
 
       call.on('joined-meeting', () => log('daily', 'Joined the room as owner'));
       call.on('left-meeting', () => log('daily', 'Left the room'));
-      call.on('dialout-connected', (ev) => {
+      call.on('participant-joined', (ev) =>
+        log('daily', `participant-joined: ${ev?.participant?.user_name || ev?.participant?.session_id || 'unknown'}`),
+      );
+      call.on('participant-left', (ev) =>
+        log('daily', `participant-left: ${ev?.participant?.user_name || 'unknown'}`),
+      );
+
+      // Transport health: this is what failed silently before.
+      call.on('network-connection', (ev) => {
+        const text = `network-connection ${ev?.type ?? ''} ${ev?.event ?? ''}`;
+        const bad = /fail|disconnect|interrupt/i.test(String(ev?.event ?? ''));
+        log(bad ? 'error' : 'daily', text);
+        if (bad) {
+          setError(
+            `Daily media transport ${ev?.event} (${ev?.type}). The browser lost its media connection, ` +
+              'so audio cannot flow. Usually a firewall or VPN blocking UDP, or a flaky network.',
+          );
+        }
+      });
+      call.on('network-quality-change', (ev) => {
+        if (ev?.threshold && ev.threshold !== 'good') log('daily', `network quality: ${ev.threshold}`);
+      });
+      call.on('nonfatal-error', (ev) => log('error', `nonfatal-error ${ev?.type}: ${ev?.errorMsg}`));
+      call.on('error', (ev) => {
+        const detail = ev?.errorMsg ?? JSON.stringify(ev ?? {});
+        setError(`Daily error: ${detail}`);
+        log('error', `Daily error: ${detail}`);
+      });
+
+      call.on('dialout-connected', () => {
         setPhase('ringing');
-        log('daily', `dialout-connected ${JSON.stringify(ev?.['sipCallId'] ?? '')}`);
+        log('daily', 'dialout-connected: the network accepted the call');
       });
       call.on('dialout-answered', () => {
         setPhase('connected');
         log('daily', 'dialout-answered: they picked up');
+
+        if (aiAnswersRef.current && sessionRef.current) {
+          sessionRef.current.sendText('The person has just answered the phone. Greet them now.');
+          log('gemini', 'Asked Gemini to greet them');
+        }
+
+        // If nothing arrives from the phone, say so rather than sitting silent.
+        watchdogRef.current = window.setTimeout(() => {
+          if (chunksInRef.current === 0) {
+            log('error', `No audio from the phone after ${NO_AUDIO_WARN_MS / 1000}s`);
+            setError(
+              'They answered, but no audio is arriving from the phone. The receive transport is ' +
+                'likely broken, so Gemini cannot hear them even if Gemini is talking.',
+            );
+          }
+        }, NO_AUDIO_WARN_MS);
       });
       call.on('dialout-stopped', () => {
         setPhase('ended');
@@ -294,42 +384,33 @@ export function DialOut() {
         setPhase('ended');
       });
       call.on('dialout-warning', (ev) => log('daily', `dialout-warning ${JSON.stringify(ev ?? {})}`));
-      call.on('error', (ev) => {
-        const detail = ev?.errorMsg ?? JSON.stringify(ev ?? {});
-        setError(`Daily error: ${detail}`);
-        log('error', `Daily error: ${detail}`);
-      });
 
-      // The caller joins as a participant; their audio track is our input.
-      const onTrack = (ev?: { participant?: DailyParticipant | null; track?: MediaStreamTrack; type?: string }) => {
-        if (!ev?.track || ev.track.kind !== 'audio') return;
-        if (ev.participant?.local) return;
-        log('daily', `Audio from ${ev.participant?.user_name || 'the phone'}`);
-        // Call-object mode does not play remote audio for you.
-        if (remoteAudioRef.current) {
-          remoteAudioRef.current.srcObject = new MediaStream([ev.track]);
-          remoteAudioRef.current.muted = !(listenIn || !aiAnswers);
-          void remoteAudioRef.current.play().catch(() => {});
-        }
-        if (aiAnswers) void bridgeToGemini(ev.track);
+      const onTrack = (ev?: { participant?: DailyParticipant | null; track?: MediaStreamTrack }) => {
+        if (!ev?.track || ev.track.kind !== 'audio' || ev.participant?.local) return;
+        log('daily', `Audio track from ${ev.participant?.user_name || 'the phone'}`);
+        void attachPhoneAudio(ev.track);
       };
       call.on('track-started', onTrack);
+      call.on('track-stopped', (ev) => {
+        if (ev?.track?.kind === 'audio' && !ev.participant?.local) log('daily', 'Their audio track stopped');
+      });
 
       setPhase('joining');
       await call.join({ url: body.roomUrl, token: body.token, startVideoOff: true, startAudioOff: true });
 
-      if (!aiAnswers) {
+      if (aiAnswers) {
+        await startGemini();
+      } else {
         await call.setLocalAudio(true);
-        log('daily', 'Your microphone is live; you will talk to the caller yourself');
+        log('daily', 'Your microphone is live; you will talk to them yourself');
       }
 
       setPhase('dialing');
       log('daily', `Starting dial-out to ${phoneNumber}`);
       const dialout = await call.startDialOut({
         phoneNumber: phoneNumber.trim(),
-        displayName: 'Caller',
-        // Explicit, rather than letting Daily fall back to the oldest number on the domain.
-        ...(callerId ? { callerId } : {}),
+        displayName: 'Phone',
+        ...(callerId?.id ? { callerId: callerId.id } : {}),
       });
       dialoutSessionRef.current = dialout?.session?.sessionId ?? null;
       log('daily', `Dial-out session ${dialoutSessionRef.current ?? 'unknown'}`);
@@ -340,7 +421,7 @@ export function DialOut() {
       setPhase('ended');
       await teardown();
     }
-  }, [aiAnswers, bridgeToGemini, callerId, listenIn, log, phoneNumber, teardown]);
+  }, [aiAnswers, attachPhoneAudio, callerId, log, phoneNumber, startGemini, teardown]);
 
   const hangUp = useCallback(async () => {
     log('info', 'Hanging up');
@@ -357,8 +438,8 @@ export function DialOut() {
   }, [log, teardown]);
 
   // "Listen in" covers both directions: Gemini's speech through the sink, and
-  // the other person's audio through the element below. In manual mode you must
-  // hear them to hold a conversation, so it is forced on.
+  // their audio through the element below. In the diagnostic mode you must hear
+  // them to hold a conversation, so it is forced on.
   const audible = listenIn || !aiAnswers;
   useEffect(() => {
     if (sinkRef.current) sinkRef.current.monitoring = audible;
@@ -402,18 +483,23 @@ export function DialOut() {
           {callerIds.length > 1 ? (
             <label>
               Caller ID they will see
-              <select name="callerId" value={callerId} onChange={(e) => setCallerId(e.target.value)} disabled={locked}>
+              <select
+                name="callerId"
+                value={callerId?.id ?? ''}
+                onChange={(e) => setCallerId(callerIds.find((n) => n.id === e.target.value) ?? null)}
+                disabled={locked}
+              >
                 {callerIds.map((n) => (
-                  <option key={n.number} value={n.number}>
+                  <option key={n.id} value={n.id}>
                     {n.label} {n.verified ? '' : `(${n.status})`}
                   </option>
                 ))}
               </select>
             </label>
           ) : (
-            callerId && (
+            callerId?.number && (
               <p className={styles.hint}>
-                Your phone will show <strong>{callerId}</strong>.
+                Your phone will show <strong>{callerId.number}</strong>.
               </p>
             )
           )}
@@ -478,6 +564,11 @@ export function DialOut() {
               {PHASE_LABEL[phase]}
               {geminiSpeaking && phase === 'connected' ? ' · Gemini speaking' : ''}
             </span>
+            {busy && (
+              <span className={styles.meters}>
+                from phone {chunksIn} chunks · from Gemini {Math.round(bytesOut / 1024)} KB
+              </span>
+            )}
           </div>
         </div>
 

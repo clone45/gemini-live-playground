@@ -129,6 +129,12 @@
   color: #3fb37f;
 }
 
+.meters {
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
 .warning {
   font-size: 13px;
   line-height: 1.55;

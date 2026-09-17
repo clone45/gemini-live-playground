@@ -23,12 +23,13 @@ export async function GET() {
 
   const body = (await response.json()) as {
     total_count?: number;
-    data?: { number?: string; name?: string; status?: string; verified?: boolean }[];
+    data?: { id?: string; number?: string; name?: string; status?: string; verified?: boolean }[];
   };
 
   const numbers = (body.data ?? [])
     .filter((n): n is { number: string } & typeof n => Boolean(n.number))
     .map((n) => ({
+      id: n.id ?? '',
       number: n.number,
       label: n.name ?? n.number,
       status: n.status ?? 'unknown',
