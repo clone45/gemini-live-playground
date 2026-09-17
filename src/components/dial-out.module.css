@@ -230,3 +230,57 @@
 .logError .kind {
   color: #ff5c5c;
 }
+
+/* ---------- cost breakdown ---------- */
+
+.costTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.costTable th {
+  text-align: left;
+  font-weight: 500;
+  padding: 5px 12px 5px 0;
+  color: var(--fg);
+}
+
+.costTable td {
+  padding: 5px 0 5px 12px;
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.qty {
+  color: var(--muted);
+  text-align: right;
+}
+
+.amount {
+  text-align: right;
+  color: var(--fg);
+}
+
+.totalRow th,
+.totalRow .amount {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.assumed {
+  font-style: normal;
+  font-size: 11px;
+  color: #e2a93b;
+}
+
+.notes {
+  margin: 4px 0 0 18px;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}

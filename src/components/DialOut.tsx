@@ -3,7 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import DailyIframe, { type DailyCall, type DailyParticipant } from '@daily-co/daily-js';
 import { Modality } from '@google/genai';
+import type { UsageMetadata } from '@google/genai';
 import { CallAudioSink, TrackRecorder } from '@/lib/call-bridge';
+import { buildBreakdown, formatMoney, type CostBreakdown } from '@/lib/pricing';
 import { newId } from '@/lib/ids';
 import { LiveSession } from '@/lib/live-session';
 import { DEFAULT_VOICE, VOICES } from '@/lib/voices';
@@ -100,6 +102,8 @@ export function DialOut() {
   const [geminiSpeaking, setGeminiSpeaking] = useState(false);
   const [chunksIn, setChunksIn] = useState(0);
   const [bytesOut, setBytesOut] = useState(0);
+  const [cost, setCost] = useState<CostBreakdown | null>(null);
+  const [costPending, setCostPending] = useState(false);
 
   const callRef = useRef<DailyCall | null>(null);
   const sessionRef = useRef<LiveSession | null>(null);
@@ -113,6 +117,10 @@ export function DialOut() {
   const bytesOutRef = useRef(0);
   const attachedRef = useRef(false);
   const watchdogRef = useRef<number | null>(null);
+  const usageRef = useRef<UsageMetadata | null>(null);
+  const roomNameRef = useRef<string | null>(null);
+  const answeredAtRef = useRef<number | null>(null);
+  const settledRef = useRef(false);
   const aiAnswersRef = useRef(aiAnswers);
   const listenInRef = useRef(listenIn);
 
@@ -175,6 +183,49 @@ export function DialOut() {
       setTurns((prev) => [...prev, turn]);
     }
   }, []);
+
+  /** Price the finished call from Daily's records and the session's token counts. */
+  const settleCost = useCallback(async () => {
+    if (settledRef.current) return;
+    settledRef.current = true;
+
+    const room = roomNameRef.current;
+    const answeredAt = answeredAtRef.current;
+    setCostPending(true);
+    try {
+      let pstnSeconds = 0;
+      let participantSeconds = 0;
+      let measured = false;
+
+      if (room) {
+        const res = await fetch(`/api/daily/usage?room=${encodeURIComponent(room)}`);
+        const body = (await res.json()) as {
+          found?: boolean;
+          pstnSeconds?: number;
+          participantSeconds?: number;
+        };
+        if (body.found) {
+          pstnSeconds = body.pstnSeconds ?? 0;
+          participantSeconds = body.participantSeconds ?? 0;
+          measured = true;
+          log('info', `Daily reported ${pstnSeconds}s on the phone leg`);
+        }
+      }
+
+      if (!measured && answeredAt) {
+        // Daily's record had not appeared yet; fall back to our own clock.
+        pstnSeconds = Math.round((Date.now() - answeredAt) / 1000);
+        participantSeconds = pstnSeconds * 2;
+        log('info', 'Daily had no record yet; timing this call locally instead');
+      }
+
+      setCost(buildBreakdown(usageRef.current, { pstnSeconds, participantSeconds, measured }));
+    } catch (err) {
+      log('error', `Could not work out the cost: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setCostPending(false);
+    }
+  }, [log]);
 
   const teardown = useCallback(async () => {
     if (watchdogRef.current) {
@@ -243,6 +294,10 @@ export function DialOut() {
           setBytesOut(bytesOutRef.current);
           sink.enqueue(data);
         },
+        // usageMetadata is cumulative for the session, so keep the newest.
+        onUsage: (usage) => {
+          usageRef.current = usage;
+        },
         onInputTranscription: (text) => appendTurn('person', text),
         onOutputTranscription: (text) => appendTurn('gemini', text),
         onInterrupted: () => {
@@ -305,14 +360,19 @@ export function DialOut() {
     bytesOutRef.current = 0;
     setChunksIn(0);
     setBytesOut(0);
+    setCost(null);
+    usageRef.current = null;
+    answeredAtRef.current = null;
+    settledRef.current = false;
     setPhase('preparing');
 
     try {
       const response = await fetch('/api/daily/session', { method: 'POST' });
-      const body = (await response.json()) as { roomUrl?: string; token?: string; error?: string };
+      const body = (await response.json()) as { roomUrl?: string; roomName?: string; token?: string; error?: string };
       if (!response.ok || !body.roomUrl || !body.token) {
         throw new Error(body.error ?? 'Could not create the Daily room');
       }
+      roomNameRef.current = body.roomName ?? body.roomUrl.split('/').pop() ?? null;
       log('daily', `Room created: ${body.roomUrl}`);
 
       // Forcing ICE relay routes media over TCP/TLS 443 instead of direct UDP,
@@ -376,6 +436,7 @@ export function DialOut() {
       });
       call.on('dialout-answered', () => {
         setPhase('connected');
+        answeredAtRef.current = Date.now();
         log('daily', 'dialout-answered: they picked up');
 
         if (aiAnswersRef.current && sessionRef.current) {
@@ -397,7 +458,7 @@ export function DialOut() {
       call.on('dialout-stopped', () => {
         setPhase('ended');
         log('daily', 'dialout-stopped: the far end hung up');
-        void teardown();
+        void teardown().then(() => settleCost());
       });
       call.on('dialout-error', (ev) => {
         const detail = JSON.stringify(ev ?? {});
@@ -456,7 +517,7 @@ export function DialOut() {
       setPhase('ended');
       await teardown();
     }
-  }, [aiAnswers, attachPhoneAudio, callerId, forceRelay, log, phoneNumber, startGemini, teardown]);
+  }, [aiAnswers, attachPhoneAudio, callerId, forceRelay, log, phoneNumber, settleCost, startGemini, teardown]);
 
   const hangUp = useCallback(async () => {
     log('info', 'Hanging up');
@@ -470,7 +531,8 @@ export function DialOut() {
     }
     await teardown();
     setPhase('ended');
-  }, [log, teardown]);
+    await settleCost();
+  }, [log, settleCost, teardown]);
 
   // "Listen in" covers both directions: Gemini's speech through the sink, and
   // their audio through the element below. In the diagnostic mode you must hear
@@ -627,6 +689,43 @@ export function DialOut() {
         {/* Call-object mode renders no remote audio on its own. */}
         <audio ref={remoteAudioRef} autoPlay playsInline hidden />
       </section>
+
+      {(cost || costPending) && (
+        <section className={styles.card}>
+          <h2>What this call cost</h2>
+          {costPending && <p className={styles.hint}>Waiting for Daily to publish the call record…</p>}
+          {cost && (
+            <>
+              <table className={styles.costTable}>
+                <tbody>
+                  {cost.lines.map((line) => (
+                    <tr key={line.label}>
+                      <th>
+                        {line.label}
+                        {!line.measured && <em className={styles.assumed}> assumed</em>}
+                      </th>
+                      <td className={styles.qty}>{line.quantity}</td>
+                      <td className={styles.qty}>{line.rate}</td>
+                      <td className={styles.amount}>{formatMoney(line.cost)}</td>
+                    </tr>
+                  ))}
+                  <tr className={styles.totalRow}>
+                    <th>Total</th>
+                    <td />
+                    <td />
+                    <td className={styles.amount}>{formatMoney(cost.total)}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <ul className={styles.notes}>
+                {cost.notes.map((note) => (
+                  <li key={note}>{note}</li>
+                ))}
+              </ul>
+            </>
+          )}
+        </section>
+      )}
 
       <section className={styles.card}>
         <h2>Conversation</h2>
