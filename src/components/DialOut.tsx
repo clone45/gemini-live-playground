@@ -38,6 +38,14 @@ interface Turn {
   text: string;
 }
 
+/** A number purchased on the Daily domain, usable as outbound caller ID. */
+interface CallerId {
+  number: string;
+  label: string;
+  status: string;
+  verified: boolean;
+}
+
 const PHASE_LABEL: Record<Phase, string> = {
   idle: 'Idle',
   preparing: 'Creating room…',
@@ -64,6 +72,8 @@ export function DialOut() {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [numbersWarning, setNumbersWarning] = useState<string | null>(null);
+  const [callerIds, setCallerIds] = useState<CallerId[]>([]);
+  const [callerId, setCallerId] = useState('');
   const [geminiSpeaking, setGeminiSpeaking] = useState(false);
 
   const callRef = useRef<DailyCall | null>(null);
@@ -84,19 +94,32 @@ export function DialOut() {
     let cancelled = false;
     fetch('/api/daily/numbers')
       .then((r) => r.json())
-      .then((body: { count?: number; numbers?: string[]; error?: string }) => {
+      .then((body: { count?: number; numbers?: CallerId[]; error?: string }) => {
         if (cancelled) return;
+        const numbers = body.numbers ?? [];
+        setCallerIds(numbers);
+
         if (body.error) {
           setNumbersWarning(body.error);
-        } else if (!body.count) {
+          return;
+        }
+        if (numbers.length === 0) {
           setNumbersWarning(
             'This Daily account has no purchased phone numbers. Dial-out uses one for caller ID, ' +
               'so the call will be rejected until you buy a number and attach billing in the Daily dashboard.',
           );
-        } else {
-          setNumbersWarning(null);
-          log('info', `Daily caller ID available: ${body.numbers?.join(', ')}`);
+          return;
         }
+
+        // Prefer a verified number; an unverified one can be refused outbound.
+        const usable = numbers.find((n) => n.verified) ?? numbers[0];
+        setCallerId(usable.number);
+        setNumbersWarning(
+          usable.verified
+            ? null
+            : `Caller ID ${usable.number} is not verified (status: ${usable.status}). Daily may refuse the call.`,
+        );
+        log('info', `Caller ID: ${usable.number}${usable.verified ? ' (verified)' : ''}`);
       })
       .catch(() => {
         if (!cancelled) setNumbersWarning('Could not check for purchased Daily numbers.');
@@ -283,7 +306,12 @@ export function DialOut() {
 
       setPhase('dialing');
       log('daily', `Starting dial-out to ${phoneNumber}`);
-      const dialout = await call.startDialOut({ phoneNumber: phoneNumber.trim(), displayName: 'Caller' });
+      const dialout = await call.startDialOut({
+        phoneNumber: phoneNumber.trim(),
+        displayName: 'Caller',
+        // Explicit, rather than letting Daily fall back to the oldest number on the domain.
+        ...(callerId ? { callerId } : {}),
+      });
       dialoutSessionRef.current = dialout?.session?.sessionId ?? null;
       log('daily', `Dial-out session ${dialoutSessionRef.current ?? 'unknown'}`);
     } catch (err) {
@@ -345,6 +373,25 @@ export function DialOut() {
               disabled={locked}
             />
           </label>
+
+          {callerIds.length > 1 ? (
+            <label>
+              Caller ID they will see
+              <select name="callerId" value={callerId} onChange={(e) => setCallerId(e.target.value)} disabled={locked}>
+                {callerIds.map((n) => (
+                  <option key={n.number} value={n.number}>
+                    {n.label} {n.verified ? '' : `(${n.status})`}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : (
+            callerId && (
+              <p className={styles.hint}>
+                They will see <strong>{callerId}</strong> as the caller.
+              </p>
+            )
+          )}
 
           <label className={styles.check}>
             <input

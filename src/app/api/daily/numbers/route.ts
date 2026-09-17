@@ -21,9 +21,19 @@ export async function GET() {
     return NextResponse.json({ error: await response.text() }, { status: 502 });
   }
 
-  const body = (await response.json()) as { total_count?: number; data?: { number?: string }[] };
-  return NextResponse.json({
-    count: body.total_count ?? body.data?.length ?? 0,
-    numbers: (body.data ?? []).map((n) => n.number).filter(Boolean),
-  });
+  const body = (await response.json()) as {
+    total_count?: number;
+    data?: { number?: string; name?: string; status?: string; verified?: boolean }[];
+  };
+
+  const numbers = (body.data ?? [])
+    .filter((n): n is { number: string } & typeof n => Boolean(n.number))
+    .map((n) => ({
+      number: n.number,
+      label: n.name ?? n.number,
+      status: n.status ?? 'unknown',
+      verified: n.verified ?? false,
+    }));
+
+  return NextResponse.json({ count: body.total_count ?? numbers.length, numbers });
 }
