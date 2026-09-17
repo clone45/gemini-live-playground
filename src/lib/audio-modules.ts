@@ -14,7 +14,10 @@ export interface AudioModules {
   AudioRecorder: (typeof import('./vendor/live-api-web-console/audio-recorder'))['AudioRecorder'];
   AudioStreamer: (typeof import('./vendor/live-api-web-console/audio-streamer'))['AudioStreamer'];
   audioContext: (typeof import('./vendor/live-api-web-console/utils'))['audioContext'];
+  createWorkletFromSrc: (typeof import('./vendor/live-api-web-console/audioworklet-registry'))['createWorketFromSrc'];
   volMeterWorklet: string;
+  /** Worklet source that turns Float32 input into 16-bit PCM chunks. */
+  recordingWorklet: string;
 }
 
 let pending: Promise<AudioModules> | null = null;
@@ -29,12 +32,16 @@ export function loadAudioModules(): Promise<AudioModules> {
       import('./vendor/live-api-web-console/audio-streamer'),
       import('./vendor/live-api-web-console/utils'),
       import('./vendor/live-api-web-console/worklets/vol-meter'),
+      import('./vendor/live-api-web-console/audioworklet-registry'),
+      import('./vendor/live-api-web-console/worklets/audio-processing'),
     ])
-      .then(([recorder, streamer, utils, volMeter]) => ({
+      .then(([recorder, streamer, utils, volMeter, registry, recording]) => ({
         AudioRecorder: recorder.AudioRecorder,
         AudioStreamer: streamer.AudioStreamer,
         audioContext: utils.audioContext,
+        createWorkletFromSrc: registry.createWorketFromSrc,
         volMeterWorklet: volMeter.default,
+        recordingWorklet: recording.default,
       }))
       .catch((err: unknown) => {
         pending = null; // let a later attempt retry
