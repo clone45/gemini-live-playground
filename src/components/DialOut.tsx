@@ -5,7 +5,7 @@ import DailyIframe, { type DailyCall, type DailyParticipant } from '@daily-co/da
 import { Modality } from '@google/genai';
 import type { UsageMetadata } from '@google/genai';
 import { CallAudioSink, TrackRecorder } from '@/lib/call-bridge';
-import { buildBreakdown, formatMoney, type CostBreakdown } from '@/lib/pricing';
+import { addUsage, buildBreakdown, EMPTY_USAGE, formatMoney, type CostBreakdown, type UsageTotals } from '@/lib/pricing';
 import { newId } from '@/lib/ids';
 import { LiveSession } from '@/lib/live-session';
 import { DEFAULT_VOICE, VOICES } from '@/lib/voices';
@@ -117,7 +117,7 @@ export function DialOut() {
   const bytesOutRef = useRef(0);
   const attachedRef = useRef(false);
   const watchdogRef = useRef<number | null>(null);
-  const usageRef = useRef<UsageMetadata | null>(null);
+  const usageRef = useRef<UsageTotals>(EMPTY_USAGE);
   const roomNameRef = useRef<string | null>(null);
   const answeredAtRef = useRef<number | null>(null);
   const settledRef = useRef(false);
@@ -186,7 +186,6 @@ export function DialOut() {
 
   /** Price the finished call from Daily's records and the session's token counts. */
   const settleCost = useCallback(async () => {
-    if (settledRef.current) return;
     settledRef.current = true;
 
     const room = roomNameRef.current;
@@ -294,9 +293,10 @@ export function DialOut() {
           setBytesOut(bytesOutRef.current);
           sink.enqueue(data);
         },
-        // usageMetadata is cumulative for the session, so keep the newest.
+        // Each usageMetadata message is one billed request. The response side
+        // covers only that turn, so they are summed rather than replaced.
         onUsage: (usage) => {
-          usageRef.current = usage;
+          usageRef.current = addUsage(usageRef.current, usage);
         },
         onInputTranscription: (text) => appendTurn('person', text),
         onOutputTranscription: (text) => appendTurn('gemini', text),
@@ -361,7 +361,7 @@ export function DialOut() {
     setChunksIn(0);
     setBytesOut(0);
     setCost(null);
-    usageRef.current = null;
+    usageRef.current = EMPTY_USAGE;
     answeredAtRef.current = null;
     settledRef.current = false;
     setPhase('preparing');
@@ -694,6 +694,16 @@ export function DialOut() {
         <section className={styles.card}>
           <h2>What this call cost</h2>
           {costPending && <p className={styles.hint}>Waiting for Daily to publish the call record…</p>}
+          {cost && !costPending && cost.lines.some((l) => !l.measured && l.label.startsWith('Daily')) && (
+            <div className={styles.buttons}>
+              <button type="button" onClick={() => void settleCost()}>
+                Recalculate from Daily
+              </button>
+              <span className={styles.hint}>
+                Daily had not published the record yet, so the phone lines are this page&apos;s own timing.
+              </span>
+            </div>
+          )}
           {cost && (
             <>
               <table className={styles.costTable}>

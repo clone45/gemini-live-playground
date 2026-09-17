@@ -23,8 +23,10 @@ interface DailyMeeting {
   participants?: DailyParticipant[];
 }
 
-const RETRIES = 4;
-const RETRY_DELAY_MS = 1500;
+// Daily publishes the meeting record a little after the room closes; a live
+// test found 6 seconds too short.
+const RETRIES = 8;
+const RETRY_DELAY_MS = 2500;
 
 export async function GET(request: Request) {
   const apiKey = process.env.DAILY_API_KEY?.trim();

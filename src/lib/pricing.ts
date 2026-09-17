@@ -58,6 +58,64 @@ function tokensFor(details: { modality?: string; tokenCount?: number }[] | undef
 }
 
 /**
+ * Running totals across a session.
+ *
+ * Every usageMetadata message describes one billed request, so they are summed
+ * rather than replaced. Measured with scripts/usage-accounting.mjs: the prompt
+ * side is the whole conversation so far, each turn's audioIn being the previous
+ * turn's audioIn plus its audioOut, while the response side reports only that
+ * turn. Keeping just the newest message therefore counted a single turn and
+ * under-reported every call.
+ *
+ * Because the prompt carries history, a long call re-bills its own context on
+ * every turn. That is normal for token billing and is why cost climbs faster
+ * than call duration.
+ */
+export interface UsageTotals {
+  audioIn: number;
+  textIn: number;
+  audioOut: number;
+  textOut: number;
+  thoughts: number;
+  /** Tokens in the reported total that no modality accounted for. */
+  other: number;
+  messages: number;
+}
+
+export const EMPTY_USAGE: UsageTotals = {
+  audioIn: 0,
+  textIn: 0,
+  audioOut: 0,
+  textOut: 0,
+  thoughts: 0,
+  other: 0,
+  messages: 0,
+};
+
+/** Fold one usageMetadata message into the running totals. */
+export function addUsage(totals: UsageTotals, usage: UsageMetadata): UsageTotals {
+  const audioIn = tokensFor(usage.promptTokensDetails, 'AUDIO');
+  const textIn = tokensFor(usage.promptTokensDetails, 'TEXT');
+  const audioOut = tokensFor(usage.responseTokensDetails, 'AUDIO');
+  const textOut = tokensFor(usage.responseTokensDetails, 'TEXT');
+
+  // Thinking tokens sit outside totalTokenCount, which equals prompt + response,
+  // so they are tracked separately and not folded into `other`.
+  const counted = audioIn + textIn + audioOut + textOut;
+  const other = Math.max(0, (usage.totalTokenCount ?? counted) - counted);
+
+  return {
+    audioIn: totals.audioIn + audioIn,
+    textIn: totals.textIn + textIn,
+    audioOut: totals.audioOut + audioOut,
+    textOut: totals.textOut + textOut,
+    thoughts: totals.thoughts + (usage.thoughtsTokenCount ?? 0),
+    other: totals.other + other,
+    messages: totals.messages + 1,
+  };
+}
+
+/**
  * Sub-dollar amounts keep four decimals so a column of them lines up and
  * fractions of a cent stay visible; anything larger reads as normal money.
  */
@@ -70,56 +128,27 @@ function formatTokens(n: number): string {
 }
 
 /** Cost of the Gemini Live session, from the API's own token accounting. */
-export function priceGemini(usage: UsageMetadata | null): CostLine[] {
-  if (!usage) return [];
-
-  const audioIn = tokensFor(usage.promptTokensDetails, 'AUDIO');
-  const textIn = tokensFor(usage.promptTokensDetails, 'TEXT');
-  const audioOut = tokensFor(usage.responseTokensDetails, 'AUDIO');
-  const textOut = tokensFor(usage.responseTokensDetails, 'TEXT');
-  const thoughts = usage.thoughtsTokenCount ?? 0;
+export function priceGemini(totals: UsageTotals | null): CostLine[] {
+  if (!totals || totals.messages === 0) return [];
 
   const lines: CostLine[] = [];
-  const add = (label: string, tokens: number, perMillion: number) => {
+  const add = (label: string, tokens: number, perMillion: number, measured = true, note = '') => {
     if (tokens <= 0) return;
     lines.push({
       label,
       quantity: formatTokens(tokens),
-      rate: `$${perMillion.toFixed(2)}/1M`,
+      rate: `$${perMillion.toFixed(2)}/1M${note}`,
       cost: (tokens / 1_000_000) * perMillion,
-      measured: true,
+      measured,
     });
   };
 
-  add('Gemini audio in', audioIn, GEMINI_PRICES.audioInputPerMillionTokens);
-  add('Gemini text in', textIn, GEMINI_PRICES.textInputPerMillionTokens);
-  add('Gemini audio out', audioOut, GEMINI_PRICES.audioOutputPerMillionTokens);
-  add('Gemini text out', textOut, GEMINI_PRICES.textOutputPerMillionTokens);
-  // Thinking tokens bill at the text output rate.
-  add('Gemini thinking', thoughts, GEMINI_PRICES.textOutputPerMillionTokens);
-
-  // Fall back to the total when the modality breakdown is absent, so a session
-  // is never reported as free just because the details were not sent.
-  const counted = audioIn + textIn + audioOut + textOut + thoughts;
-  const total = usage.totalTokenCount ?? 0;
-  if (lines.length === 0 && total > 0) {
-    lines.push({
-      label: 'Gemini tokens (no modality breakdown)',
-      quantity: formatTokens(total),
-      rate: `$${GEMINI_PRICES.audioOutputPerMillionTokens.toFixed(2)}/1M assumed`,
-      cost: (total / 1_000_000) * GEMINI_PRICES.audioOutputPerMillionTokens,
-      measured: false,
-    });
-  } else if (total > counted) {
-    const remainder = total - counted;
-    lines.push({
-      label: 'Gemini other tokens',
-      quantity: formatTokens(remainder),
-      rate: `$${GEMINI_PRICES.textInputPerMillionTokens.toFixed(2)}/1M assumed`,
-      cost: (remainder / 1_000_000) * GEMINI_PRICES.textInputPerMillionTokens,
-      measured: false,
-    });
-  }
+  add('Gemini audio in', totals.audioIn, GEMINI_PRICES.audioInputPerMillionTokens);
+  add('Gemini text in', totals.textIn, GEMINI_PRICES.textInputPerMillionTokens);
+  add('Gemini audio out', totals.audioOut, GEMINI_PRICES.audioOutputPerMillionTokens);
+  add('Gemini text out', totals.textOut, GEMINI_PRICES.textOutputPerMillionTokens);
+  add('Gemini thinking', totals.thoughts, GEMINI_PRICES.textOutputPerMillionTokens);
+  add('Gemini unattributed', totals.other, GEMINI_PRICES.textInputPerMillionTokens, false, ' assumed');
 
   return lines;
 }
@@ -162,7 +191,7 @@ export function priceDaily(usage: DailyUsage): CostLine[] {
   return lines;
 }
 
-export function buildBreakdown(usage: UsageMetadata | null, daily: DailyUsage): CostBreakdown {
+export function buildBreakdown(usage: UsageTotals | null, daily: DailyUsage): CostBreakdown {
   const lines = [...priceDaily(daily), ...priceGemini(usage)];
   const total = lines.reduce((sum, l) => sum + l.cost, 0);
 
@@ -177,6 +206,12 @@ export function buildBreakdown(usage: UsageMetadata | null, daily: DailyUsage): 
     `The phone number itself costs $${DAILY_PRICES.usPhoneNumberPerMonth.toFixed(2)}/month and is not included.`,
   );
   notes.push('A key on the Gemini free tier pays nothing for the Gemini lines.');
+  if (usage && usage.messages > 0) {
+    notes.push(
+      `Summed over ${usage.messages} billed request${usage.messages === 1 ? '' : 's'}. Each turn re-bills ` +
+        'the conversation so far, so cost grows faster than call length.',
+    );
+  }
 
   return { lines, total, notes };
 }
