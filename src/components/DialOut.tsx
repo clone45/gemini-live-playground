@@ -88,7 +88,7 @@ export function DialOut() {
   const [instruction, setInstruction] = useState(DEFAULT_INSTRUCTION);
   const [aiAnswers, setAiAnswers] = useState(true);
   const [listenIn, setListenIn] = useState(true);
-  const [forceRelay, setForceRelay] = useState(true);
+  const [forceRelay, setForceRelay] = useState(false);
 
   const [phase, setPhase] = useState<Phase>('idle');
   const [logs, setLogs] = useState<LogRow[]>([]);
@@ -315,9 +315,10 @@ export function DialOut() {
       }
       log('daily', `Room created: ${body.roomUrl}`);
 
-      // Forcing ICE relay routes media through Daily's TURN servers, which
-      // reach out over TCP/TLS 443. Direct UDP to the SFU is what fails behind
-      // restrictive firewalls, on VPNs, and from NAT'd environments like WSL.
+      // Forcing ICE relay routes media over TCP/TLS 443 instead of direct UDP,
+      // which helps behind restrictive firewalls. Daily gates iceConfig behind
+      // the advanced_firewall_control add-on and ignores it otherwise, so this
+      // is off by default and reported plainly when it is refused.
       const call = DailyIframe.createCallObject({
         subscribeToTracksAutomatically: true,
         ...(forceRelay ? { dailyConfig: { iceConfig: { iceTransportPolicy: 'relay' as RTCIceTransportPolicy } } } : {}),
@@ -351,7 +352,18 @@ export function DialOut() {
       call.on('network-quality-change', (ev) => {
         if (ev?.threshold && ev.threshold !== 'good') log('daily', `network quality: ${ev.threshold}`);
       });
-      call.on('nonfatal-error', (ev) => log('error', `nonfatal-error ${ev?.type}: ${ev?.errorMsg}`));
+      call.on('nonfatal-error', (ev) => {
+        const message = String(ev?.errorMsg ?? '');
+        if (/advanced_firewall_control/i.test(message)) {
+          log(
+            'info',
+            'Daily ignored the TURN relay setting: iceConfig needs the advanced_firewall_control ' +
+              'add-on, which this account does not have. The call is using default ICE.',
+          );
+          return;
+        }
+        log('error', `nonfatal-error ${ev?.type}: ${message}`);
+      });
       call.on('error', (ev) => {
         const detail = ev?.errorMsg ?? JSON.stringify(ev ?? {});
         setError(`Daily error: ${detail}`);
@@ -535,9 +547,10 @@ export function DialOut() {
               disabled={locked}
             />
             <span>
-              <strong>Force media through TURN relay.</strong> Routes audio over TCP/TLS 443 instead
-              of direct UDP. Slightly higher latency, but it is what gets through firewalls, VPNs and
-              NAT&apos;d environments. Turn it off only once calls work reliably.
+              <strong>Force media through TURN relay.</strong> Routes audio over TCP/TLS 443 rather
+              than direct UDP, which helps behind strict firewalls. Requires Daily&apos;s
+              <code> advanced_firewall_control</code> add-on; without it Daily ignores the setting
+              and says so in the log.
             </span>
           </label>
 

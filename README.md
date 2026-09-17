@@ -18,6 +18,37 @@ npm run dev
 Open <http://localhost:3000>, click **Connect**, allow the microphone, and talk. Chrome is the
 best-tested browser for the Web Audio worklet used for capture.
 
+## Phone calls: `/dial-out`
+
+Places a real PSTN call through [Daily](https://daily.co) and puts Gemini on the line. The browser
+tab is the AI participant in the room:
+
+```
+phone  ->  Daily  ->  TrackRecorder  ->  16 kHz PCM  ->  Gemini Live
+phone  <-  Daily  <-  CallAudioSink  <-  24 kHz PCM  <-  Gemini Live
+```
+
+Daily terminates the phone leg, Web Audio handles rate conversion, and the page publishes Gemini's
+speech as its own microphone track. No media server and no telephony transcoding to maintain.
+
+Set `DAILY_API_KEY` in `.env.local`, server-side only. You also need a **purchased Daily phone
+number** with billing attached; the page checks on load and tells you if there is none.
+
+Four things cost real time to discover, so they are written down:
+
+- **`callerId` takes the number's id, not the number.** Passing the E.164 string gets
+  `Incorrect callerID! No phone number maps to +1…`. Use the `id` from `purchased-phone-numbers`.
+- **Dial-out requires the room on the SFU.** A small room starts peer-to-peer, and the automatic
+  switch can fail with only `Switch to soup failed, could not initiate dial out` to show for it.
+  The page forces it with `setNetworkTopology({ topology: 'sfu' })` after joining. Setting
+  `sfu_switchover` at room creation does not work: Daily accepts the property and silently drops it.
+- **`iceConfig` needs the `advanced_firewall_control` add-on.** Without it Daily ignores the
+  setting, so the TURN relay toggle is off by default.
+- **Call-object mode renders no remote audio.** Nothing plays locally unless you attach the track to
+  an audio element yourself.
+
+Browser WebRTC from inside WSL generally cannot reach an SFU. Run the browser on the host.
+
 ## Microphone test page
 
 If the microphone seems dead, open <http://localhost:3000/mic-test>. It shares no code with the
