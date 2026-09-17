@@ -88,6 +88,7 @@ export function DialOut() {
   const [instruction, setInstruction] = useState(DEFAULT_INSTRUCTION);
   const [aiAnswers, setAiAnswers] = useState(true);
   const [listenIn, setListenIn] = useState(true);
+  const [forceRelay, setForceRelay] = useState(true);
 
   const [phase, setPhase] = useState<Phase>('idle');
   const [logs, setLogs] = useState<LogRow[]>([]);
@@ -314,8 +315,15 @@ export function DialOut() {
       }
       log('daily', `Room created: ${body.roomUrl}`);
 
-      const call = DailyIframe.createCallObject({ subscribeToTracksAutomatically: true });
+      // Forcing ICE relay routes media through Daily's TURN servers, which
+      // reach out over TCP/TLS 443. Direct UDP to the SFU is what fails behind
+      // restrictive firewalls, on VPNs, and from NAT'd environments like WSL.
+      const call = DailyIframe.createCallObject({
+        subscribeToTracksAutomatically: true,
+        ...(forceRelay ? { dailyConfig: { iceConfig: { iceTransportPolicy: 'relay' as RTCIceTransportPolicy } } } : {}),
+      });
       callRef.current = call;
+      log('info', forceRelay ? 'Media forced through TURN relay' : 'Media using default ICE (direct if possible)');
 
       call.on('joined-meeting', () => log('daily', 'Joined the room as owner'));
       call.on('left-meeting', () => log('daily', 'Left the room'));
@@ -333,8 +341,10 @@ export function DialOut() {
         log(bad ? 'error' : 'daily', text);
         if (bad) {
           setError(
-            `Daily media transport ${ev?.event} (${ev?.type}). The browser lost its media connection, ` +
-              'so audio cannot flow. Usually a firewall or VPN blocking UDP, or a flaky network.',
+            `Daily media transport ${ev?.event} (${ev?.type}). The browser could not hold a media ` +
+              'connection to Daily. If "force media through TURN relay" is already on, the likeliest ' +
+              'cause is the browser environment itself: WebRTC from a browser running inside WSL is ' +
+              'often unable to reach an SFU. Try Chrome on Windows against the same URL.',
           );
         }
       });
@@ -398,6 +408,19 @@ export function DialOut() {
       setPhase('joining');
       await call.join({ url: body.roomUrl, token: body.token, startVideoOff: true, startAudioOff: true });
 
+      // Dial-out requires the room on the SFU. A small room starts peer-to-peer
+      // and Daily tries to switch when dial-out begins; when that fails it
+      // reports only "Switch to soup failed, could not initiate dial out".
+      // Doing it here makes the switch explicit and its failure legible.
+      const topology = await call.setNetworkTopology({ topology: 'sfu' });
+      if (topology?.error) {
+        throw new Error(
+          `Could not move the room onto Daily's SFU: ${topology.error}. Dial-out cannot start ` +
+            'without it. This is the same failure as "Switch to soup failed".',
+        );
+      }
+      log('daily', 'Room is on the SFU');
+
       if (aiAnswers) {
         await startGemini();
       } else {
@@ -421,7 +444,7 @@ export function DialOut() {
       setPhase('ended');
       await teardown();
     }
-  }, [aiAnswers, attachPhoneAudio, callerId, log, phoneNumber, startGemini, teardown]);
+  }, [aiAnswers, attachPhoneAudio, callerId, forceRelay, log, phoneNumber, startGemini, teardown]);
 
   const hangUp = useCallback(async () => {
     log('info', 'Hanging up');
@@ -503,6 +526,20 @@ export function DialOut() {
               </p>
             )
           )}
+
+          <label className={styles.check}>
+            <input
+              type="checkbox"
+              checked={forceRelay}
+              onChange={(e) => setForceRelay(e.target.checked)}
+              disabled={locked}
+            />
+            <span>
+              <strong>Force media through TURN relay.</strong> Routes audio over TCP/TLS 443 instead
+              of direct UDP. Slightly higher latency, but it is what gets through firewalls, VPNs and
+              NAT&apos;d environments. Turn it off only once calls work reliably.
+            </span>
+          </label>
 
           <label className={styles.check}>
             <input

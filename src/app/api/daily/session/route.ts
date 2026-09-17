@@ -31,6 +31,9 @@ export async function POST() {
       properties: {
         exp: expires,
         enable_dialout: true,
+        // Note: sfu_switchover is not settable here. Daily accepts the request
+        // and silently drops the property, so the page forces SFU topology from
+        // the client after joining instead.
         enable_chat: false,
         enable_screenshare: false,
         start_video_off: true,
